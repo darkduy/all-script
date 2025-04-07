@@ -1,0 +1,322 @@
+-- Auto Farm Bonds V4 + Auto Replay + Optimized & Configurable ESP + Advanced GUI Drag by ChatGPT
+
+-- Services
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local Debris = game:GetService("Debris")
+local UserInputService = game:GetService("UserInputService")
+local player = Players.LocalPlayer
+local currentCamera = workspace.CurrentCamera
+
+-- State management
+local farming = false
+local paused = false
+local activeTween = nil
+local autoReplayEnabled = true
+local espEnabled = false
+
+-- Configuration (có thể điều chỉnh qua GUI)
+local config = {
+    bondUpdateInterval = 1,       -- khoảng thời gian cập nhật danh sách Bond (giây)
+    detectionDistance = 50,       -- khoảng cách tối đa để di chuyển nhanh
+    tweenSpeedFactor = 50,        -- tốc độ tween (dựa trên khoảng cách chia cho factor)
+    farmUpdateInterval = 0.1       -- khoảng thời gian gọi farm mỗi Heartbeat
+}
+
+-- Cached bonds và ESP
+local cachedBonds = {}
+local lastBondUpdate = 0
+local ESPCache = {}
+local replayButtonCache = nil
+local lastReplayCheck = 0
+
+-- Tạo GUI kéo thả với cấu hình
+local gui = Instance.new("ScreenGui", player:WaitForChild("PlayerGui"))
+gui.Name = "BondFarmGUI"
+gui.ResetOnSpawn = false
+
+-- Hàm tạo khung kéo thả tùy chỉnh
+local function createDraggableFrame()
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(0, 300, 0, 240)
+    frame.Position = UDim2.new(0, 100, 0, 100)
+    frame.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+    frame.Active = true
+
+    local dragging = false
+    local dragInput, dragStart, frameStart
+
+    frame.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = true
+            dragStart = input.Position
+            frameStart = frame.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                end
+            end)
+        end
+    end)
+
+    frame.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement then
+            dragInput = input
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if input == dragInput and dragging then
+            local delta = input.Position - dragStart
+            frame.Position = UDim2.new(
+                frameStart.X.Scale, frameStart.X.Offset + delta.X,
+                frameStart.Y.Scale, frameStart.Y.Offset + delta.Y
+            )
+        end
+    end)
+
+    return frame
+end
+
+local mainFrame = createDraggableFrame()
+mainFrame.Parent = gui
+
+-- Tạo các nút điều khiển chính
+local function createButton(text, pos, size)
+    local btn = Instance.new("TextButton")
+    btn.Size = size or UDim2.new(0, 120, 0, 40)
+    btn.Position = pos or UDim2.new(0, 0, 0, 0)
+    btn.Text = text
+    btn.BackgroundColor3 = Color3.fromRGB(60, 120, 60)
+    btn.TextColor3 = Color3.new(1, 1, 1)
+    btn.Font = Enum.Font.SourceSansBold
+    btn.TextSize = 18
+    btn.Parent = mainFrame
+    return btn
+end
+
+local btnFarm = createButton("Start Auto Farm", UDim2.new(0, 10, 0, 10))
+local btnESP  = createButton("Toggle ESP", UDim2.new(0, 140, 0, 10))
+local btnReplay = createButton("Toggle Auto Replay", UDim2.new(0, 10, 0, 60))
+local btnPause = createButton("Pause Farm", UDim2.new(0, 140, 0, 60))
+
+-- Phần cấu hình: Hiển thị thông số và cho phép thay đổi
+local configLabel = Instance.new("TextLabel", mainFrame)
+configLabel.Size = UDim2.new(0, 280, 0, 40)
+configLabel.Position = UDim2.new(0, 10, 0, 110)
+configLabel.Text = "Config: Distance="..config.detectionDistance.." | TweenFactor="..config.tweenSpeedFactor
+configLabel.TextColor3 = Color3.new(1, 1, 1)
+configLabel.BackgroundTransparency = 1
+configLabel.TextSize = 16
+
+-- (Có thể bổ sung thêm slider/input nếu cần)
+
+-- Tạo label trạng thái farm
+local statusLabel = Instance.new("TextLabel", mainFrame)
+statusLabel.Size = UDim2.new(0, 280, 0, 30)
+statusLabel.Position = UDim2.new(0, 10, 0, 150)
+statusLabel.Text = "Status: Idle"
+statusLabel.TextColor3 = Color3.new(1, 1, 0)
+statusLabel.BackgroundTransparency = 1
+statusLabel.TextSize = 16
+
+-- Hàm cập nhật danh sách Bond (sử dụng GetParts cho hiệu năng)
+local function updateBondList()
+    local tempBonds = {}
+    for _, part in ipairs(workspace:GetParts()) do
+        if part:IsA("BasePart") and part.Name == "Bond" then
+            tempBonds[part] = true
+        end
+    end
+    -- Xóa các Bond không còn tồn tại
+    for bond in pairs(cachedBonds) do
+        if not tempBonds[bond] or not bond:IsDescendantOf(workspace) then
+            cachedBonds[bond] = nil
+        end
+    end
+    -- Thêm Bond mới
+    for bond in pairs(tempBonds) do
+        if not cachedBonds[bond] then
+            cachedBonds[bond] = true
+        end
+    end
+end
+
+-- ESP: Cập nhật hoặc tạo mới ESP cho 1 Bond
+local function updateESP(bond)
+    local esp = ESPCache[bond]
+    if not esp then
+        esp = {
+            box = Instance.new("Frame"),
+            label = Instance.new("TextLabel")
+        }
+        esp.box.Size = UDim2.new(0, 10, 0, 10)
+        esp.box.BackgroundTransparency = 0.5
+        esp.box.BorderColor3 = Color3.fromRGB(255, 0, 0)
+        esp.box.BorderSizePixel = 2
+        esp.box.ZIndex = 10
+        esp.box.Parent = gui
+        
+        esp.label.Size = UDim2.new(0, 100, 0, 20)
+        esp.label.Text = "Bond"
+        esp.label.TextColor3 = Color3.new(1, 1, 1)
+        esp.label.BackgroundTransparency = 1
+        esp.label.TextSize = 14
+        esp.label.ZIndex = 10
+        esp.label.Parent = gui
+        
+        ESPCache[bond] = esp
+    end
+
+    local pos, onScreen = currentCamera:WorldToViewportPoint(bond.Position)
+    if onScreen then
+        esp.box.Visible = espEnabled
+        esp.label.Visible = espEnabled
+        esp.box.Position = UDim2.new(0, pos.X, 0, pos.Y)
+        esp.label.Position = UDim2.new(0, pos.X, 0, pos.Y - 15)
+    else
+        esp.box.Visible = false
+        esp.label.Visible = false
+    end
+end
+
+local function cleanUpESPCache()
+    for bond, esp in pairs(ESPCache) do
+        if not bond:IsDescendantOf(workspace) then
+            esp.box:Destroy()
+            esp.label:Destroy()
+            ESPCache[bond] = nil
+        end
+    end
+end
+
+-- Auto Farm: Sử dụng tween mượt với khả năng hủy tween nếu cần
+local function farmBondsV4()
+    if not player.Character or not player.Character:FindFirstChild("HumanoidRootPart") then return end
+    local hrp = player.Character.HumanoidRootPart
+
+    if tick() - lastBondUpdate >= config.bondUpdateInterval then
+        pcall(updateBondList)
+        lastBondUpdate = tick()
+    end
+
+    local closestBond, minDistance = nil, math.huge
+    for bond in pairs(cachedBonds) do
+        if bond and bond:IsDescendantOf(workspace) then
+            local distance = (hrp.Position - bond.Position).magnitude
+            if distance < minDistance then
+                minDistance = distance
+                closestBond = bond
+            end
+        end
+    end
+
+    if closestBond then
+        statusLabel.Text = "Status: Bond found ("..math.floor(minDistance).." studs)"
+        if activeTween then
+            activeTween:Cancel()
+            activeTween = nil
+        end
+
+        if minDistance < 10 then
+            hrp.CFrame = CFrame.new(closestBond.Position + Vector3.new(0, 3, 0))
+            pcall(function()
+                firetouchinterest(hrp, closestBond, 0)
+                firetouchinterest(hrp, closestBond, 1)
+            end)
+        else
+            local duration = minDistance / config.tweenSpeedFactor
+            local tweenInfo = TweenInfo.new(duration, Enum.EasingStyle.Linear)
+            activeTween = TweenService:Create(hrp, tweenInfo, {CFrame = CFrame.new(closestBond.Position + Vector3.new(0, 3, 0))})
+            activeTween:Play()
+            activeTween.Completed:Connect(function()
+                pcall(function()
+                    firetouchinterest(hrp, closestBond, 0)
+                    firetouchinterest(hrp, closestBond, 1)
+                end)
+                activeTween = nil
+            end)
+        end
+    else
+        statusLabel.Text = "Status: No Bond found"
+    end
+end
+
+-- Auto Replay: Kiểm tra và kích hoạt nút replay theo chu kỳ
+local function autoReplay()
+    if not autoReplayEnabled then return end
+    if tick() - lastReplayCheck < 5 then return end
+    lastReplayCheck = tick()
+
+    if replayButtonCache and replayButtonCache:IsDescendantOf(game) then
+        pcall(replayButtonCache.Activate, replayButtonCache)
+        return
+    end
+
+    replayButtonCache = nil
+    for _, v in ipairs(player.PlayerGui:GetDescendants()) do
+        if v:IsA("TextButton") and (v.Text:lower():find("replay") or v.Name:lower():find("replay")) then
+            replayButtonCache = v
+            pcall(v.Activate, v)
+            break
+        end
+    end
+end
+
+-- Main loop sử dụng Heartbeat
+local farmCooldown = 0
+RunService.Heartbeat:Connect(function(deltaTime)
+    if farming and not paused then
+        farmCooldown = farmCooldown + deltaTime
+        if farmCooldown >= config.farmUpdateInterval then
+            pcall(farmBondsV4)
+            farmCooldown = 0
+        end
+    end
+
+    if espEnabled then
+        pcall(cleanUpESPCache)
+        for bond in pairs(cachedBonds) do
+            if bond:IsDescendantOf(workspace) then
+                pcall(updateESP, bond)
+            end
+        end
+    end
+
+    pcall(autoReplay)
+end)
+
+-- Handler cho các nút GUI
+btnFarm.MouseButton1Click:Connect(function()
+    farming = not farming
+    btnFarm.Text = farming and "Stop Auto Farm" or "Start Auto Farm"
+    btnFarm.BackgroundColor3 = farming and Color3.fromRGB(200, 60, 60) or Color3.fromRGB(60, 120, 60)
+    statusLabel.Text = "Status: Idle"
+end)
+
+btnESP.MouseButton1Click:Connect(function()
+    espEnabled = not espEnabled
+    btnESP.Text = espEnabled and "ESP ON" or "ESP OFF"
+    btnESP.BackgroundColor3 = espEnabled and Color3.fromRGB(200, 60, 60) or Color3.fromRGB(60, 60, 200)
+    if not espEnabled then
+        for _, esp in pairs(ESPCache) do
+            esp.box:Destroy()
+            esp.label:Destroy()
+        end
+        ESPCache = {}
+    end
+end)
+
+btnReplay.MouseButton1Click:Connect(function()
+    autoReplayEnabled = not autoReplayEnabled
+    btnReplay.Text = autoReplayEnabled and "Auto Replay ON" or "Auto Replay OFF"
+    btnReplay.BackgroundColor3 = autoReplayEnabled and Color3.fromRGB(60, 200, 60) or Color3.fromRGB(200, 60, 60)
+end)
+
+btnPause.MouseButton1Click:Connect(function()
+    paused = not paused
+    btnPause.Text = paused and "Resume Farm" or "Pause Farm"
+    btnPause.BackgroundColor3 = paused and Color3.fromRGB(200, 200, 60) or Color3.fromRGB(60, 120, 60)
+    statusLabel.Text = paused and "Status: Paused" or "Status: Running"
+end)
